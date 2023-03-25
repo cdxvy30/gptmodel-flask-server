@@ -1,0 +1,10 @@
+{
+  "labels": {
+      "1": "excavator",
+      "2": "dump_truck",
+      "3": "mobile_crane",
+      "4": "helmet",
+      "5": "human",
+      "6": "upper body w/ vest"
+    }
+}
