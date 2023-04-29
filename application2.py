@@ -7,12 +7,11 @@ from PIL import Image
 from flask import Flask, jsonify, request
 import clip
 from transformers import GPT2LMHeadModel, AutoTokenizer
+from torchmetrics.functional import pairwise_cosine_similarity
 from typing import Tuple, Optional, Union
 import torch.nn as nn
-# import sys
+import math
 
-# sys.path.insert(1, '/home/cdxvy30/object-detection')
-# import model_final
 
 def get_object_model(model_path):
     num_classes = 7
@@ -27,6 +26,32 @@ def get_object_model(model_path):
 
     model.eval()
     return model
+
+def get_cnn_captionType_model(model_path):
+    cnn_captionType_model = torch.load(model_path)
+    cnn_captionType_model.to(device)
+
+    return cnn_captionType_model
+
+def get_cnn_violationType_model(model_path):
+    cnn_violationType_model = torch.load(model_path)
+    cnn_violationType_model.to(device)
+
+    return cnn_violationType_model
+
+def get_cnn_image_encoder(caption_model, model_path):
+    prefix_length = 20
+    image_encoder = torchvision.models.resnet152()
+    num_ftrs = image_encoder.fc.in_features
+    image_encoder.fc = nn.Sequential(
+        nn.Linear(num_ftrs, (caption_model.model_embedding_size*prefix_length)//2),
+        nn.Tanh(),
+        nn.Linear((caption_model.model_embedding_size*prefix_length)//2,caption_model.model_embedding_size*prefix_length),
+    )
+    image_encoder.load_state_dict(torch.load(model_path, map_location="cpu"))
+    image_encoder.to(device)
+
+    return image_encoder
 
 def get_clip_model(model_path):
     model, preprocess = clip.load("ViT-B/32", device=device)
@@ -93,6 +118,21 @@ def clip_classification(image):
 
     return prediction['caption_type'], prediction['violation_type']
 
+def cnn_classification(image):
+
+    image = image.convert('RGB')
+    transform_toTensor = torchvision.transforms.Compose([torchvision.transforms.Resize([256,256]), torchvision.transforms.CenterCrop([224,224]), torchvision.transforms.ToTensor()])
+    image = transform_toTensor(image)
+    image = image.unsqueeze(0)
+    image = image.to(device, dtype=torch.float32)
+
+    _, caption_type_idx = torch.max(cnn_captionType_model(image), 1)
+    caption_type = cnn_type_dict['caption_type'][caption_type_idx]
+
+    _, violation_type_idx = torch.max(cnn_violationType_model(image), 1)
+    violation_type = cnn_type_dict['violation_type'][violation_type_idx]
+    return caption_type, violation_type
+
 def image_caption(image, caption_type, violation_type):
     prefix_length = 20
     attribute_length = 20
@@ -107,6 +147,27 @@ def image_caption(image, caption_type, violation_type):
 
     prefix_embed = caption_model.clip_project(prefix).reshape(1, prefix_length, -1)
     embedding_text = caption_model.gpt.transformer.wte(encode_attribute).unsqueeze(0)
+    embedding_cat = torch.cat((prefix_embed, embedding_text), dim=1)
+
+    return generate_beam(caption_model, tokenizer, embed=embedding_cat)
+
+def cnn_image_caption(image, caption_type, violation_type):
+    prefix_length = 20
+    attribute_length = 20
+
+    image = image.convert('RGB')
+    transform_toTensor = torchvision.transforms.Compose([torchvision.transforms.Resize([256,256]), torchvision.transforms.CenterCrop([224,224]), torchvision.transforms.ToTensor()])
+    image = transform_toTensor(image)
+    image = image.unsqueeze(0).to(device, dtype=torch.float32)
+
+    attribute = f'{caption_type} {violation_type} '
+    
+    encode_attribute = torch.tensor(tokenizer.encode(attribute), dtype=torch.int64)
+    padding = attribute_length - encode_attribute.shape[0]
+    encode_attribute = torch.cat((encode_attribute, torch.zeros(padding, dtype=torch.int64))).to(device)
+
+    prefix_embed = cnn_image_encoder(image).reshape(1, prefix_length, -1)
+    embedding_text = caption_model.model.transformer.wte(encode_attribute).unsqueeze(0)
     embedding_cat = torch.cat((prefix_embed, embedding_text), dim=1)
 
     return generate_beam(caption_model, tokenizer, embed=embedding_cat)
@@ -133,25 +194,39 @@ class ClipCaptionModel(nn.Module):
     def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, attribute: torch.Tensor, mask: Optional[torch.Tensor]=None,
                 labels: Optional[torch.Tensor] = None):
         embedding_text = torch.cat((attribute, tokens), dim=1)
-        embedding_text = self.gpt.transformer.wte(embedding_text)
+        # embedding_text = self.gpt.transformer.wte(embedding_text)
+        #cnn try
+        embedding_text = self.model.transformer.wte(embedding_text)
 
-        prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
+
+
+        # prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
+        
+        #cnn try
+        prefix_projections = prefix.view(-1, self.prefix_length, self.model_embedding_size)
+
         embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
         
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
             labels = torch.cat((dummy_token, tokens), dim=1)
-        out = self.gpt(inputs_embeds=embedding_cat, labels=labels, attention_mask=mask)
+        # out = self.gpt(inputs_embeds=embedding_cat, labels=labels, attention_mask=mask)
+        #cnn try
+        out = self.model(inputs_embeds=embedding_cat, labels=labels, attention_mask=mask)
         return out
 
     def __init__(self, prefix_length: int, clip_length: Optional[int] = None, prefix_size: int = 512,
                  num_layers: int = 8, gpt2_type: str = ''):
         super(ClipCaptionModel, self).__init__()
         self.prefix_length = prefix_length
-        self.gpt = GPT2LMHeadModel.from_pretrained(gpt2_type)
-        self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
-        self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
-                                     self.gpt_embedding_size * prefix_length))
+        # self.gpt = GPT2LMHeadModel.from_pretrained(gpt2_type)
+        # self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
+        self.model = GPT2LMHeadModel.from_pretrained(gpt2_type)
+        self.model_embedding_size = self.model.transformer.wte.weight.shape[1]
+
+        #cnn_try
+        # self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
+        #                              self.gpt_embedding_size * prefix_length))
 
 def generate_beam(
     model,
@@ -179,9 +254,9 @@ def generate_beam(
             if tokens is None:
                 tokens = torch.tensor(tokenizer.encode(prompt))
                 tokens = tokens.unsqueeze(0).to(device)
-                generated = model.gpt.transformer.wte(tokens)
+                generated = model.model.transformer.wte(tokens)
         for i in range(entry_length):
-            outputs = model.gpt(inputs_embeds=generated, output_attentions=True)
+            outputs = model.model(inputs_embeds=generated, output_attentions=True)
             logits = outputs.logits
             logits = logits[:, -1, :] / (temperature if temperature > 0 else 1.0)
             logits = logits.softmax(-1).log()
@@ -212,7 +287,7 @@ def generate_beam(
                 generated = generated[next_tokens_source]
                 scores = scores_sum_average * seq_lengths
                 is_stopped = is_stopped[next_tokens_source]
-            next_token_embed = model.gpt.transformer.wte(next_tokens.squeeze()).view(
+            next_token_embed = model.model.transformer.wte(next_tokens.squeeze()).view(
                 generated.shape[0], 1, -1
             )
             generated = torch.cat((generated, next_token_embed), dim=1)
@@ -232,6 +307,59 @@ def generate_beam(
 
     return output_text
 
+def computeIDF(enc_caption, enc_issueType):
+    uniqueWords = set(enc_caption).union(set(enc_issueType))
+    numOfWordA = dict.fromkeys(uniqueWords, 0)
+    for word in enc_caption:
+        numOfWordA[word] += 1
+    numOfWordB = dict.fromkeys(uniqueWords, 0)
+    for word in enc_issueType:
+        numOfWordB[word] += 1
+
+    documents = [numOfWordA, numOfWordB]
+    n = len(documents)
+    idfDict = dict.fromkeys(documents[0].keys(), 0)
+    for document in documents:
+        for word, val in document.items():
+            if val > 0:
+                idfDict[word] += 1
+
+    for word, val in idfDict.items():
+        idfDict[word] = math.log((n+3) / float(val))
+        # if idfDict[word] == 0:
+        #     idfDict[word] = 0.4
+
+    #gpt bos & eos
+    idfDict[102] = 0
+    idfDict[101] = 0
+    return(idfDict)
+
+def similarity_caption_issueType(capt, vioType):
+    f = open(issueType_path)
+    issueType_list = json.load(f)
+    f.close()
+
+    capt = tokenizer.encode(capt)
+    emb_capt = caption_model.model.transformer.wte(torch.tensor(capt, dtype=torch.int64).to(device))
+    issueTypes = issueType_list[vioType]
+
+    r_score_list = []
+    for issueType in issueTypes:
+        issueType = tokenizer.encode(issueType)
+        idfs = computeIDF(capt, issueType)
+        emb_issueType = caption_model.model.transformer.wte(torch.tensor(issueType, dtype=torch.int64).to(device))
+
+        max_simi = torch.max(pairwise_cosine_similarity(emb_capt,emb_issueType), 0).values
+        ref_idfs = torch.tensor([idfs[token] for token in issueType]).to(device)
+
+        r_score = torch.sum(torch.mul(max_simi,ref_idfs))/torch.sum(ref_idfs)
+        r_score_list.append(r_score.unsqueeze(0))
+    r_score_list = torch.cat(r_score_list, dim=0)
+
+    return(issueTypes[torch.argmax(r_score_list)])
+
+
+
 @application.route('/predict', methods=['POST'])
 def predict():
     i = 0
@@ -245,15 +373,23 @@ def predict():
         file.save(saveLocation)
         image = Image.open(saveLocation)
 
+        # prediction = object_detection(image)
+        # caption_type, violation_type = clip_classification(image)
+        # caption = image_caption(image, caption_type, violation_type)
+        # issue_type = similarity_caption_issueType(caption, violation_type) 
+
+        #cnn try
         prediction = object_detection(image)
-        caption_type, violation_type = clip_classification(image)
-        caption = image_caption(image, caption_type, violation_type) 
+        caption_type, violation_type = cnn_classification(image)
+        caption = cnn_image_caption(image, caption_type, violation_type)
+        issue_type = similarity_caption_issueType(caption, violation_type) 
         
         return jsonify({"boxes": prediction['boxes'], 
             "labels": prediction['labels'], 
             "scores": prediction['scores'], 
             "caption_type": caption_type,
             "violation_type": violation_type,
+            "issue_type": issue_type,
             'caption': caption,
             })
 
@@ -270,16 +406,32 @@ device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 object_model_path = 'model_final.pth'
 clip_model_path = 'clip_comb2_0_comb9_6_cap2_5.pt'
-caption_model_path = 'coco_prefix_ct-0399.pt'
+# caption_model_path = 'coco_prefix_ct-0399.pt'
 label_path = 'labels.json'
+issueType_path = 'issueType.json'
+#CNN try
+cnn_captionType_model_path = 'CNN_caption_type_classifier.pt'
+cnn_violationType_model_path = 'CNN_violation_type_classifier.pt'
+cnn_image_encoder_path = 'CNN-image-encoder-gpt2-coco_prefix_ct-MappingType.MLP-only_prefix(False)-only_image(False)-best_model.pt'
+caption_model_path = 'CNN-gpt2-coco_prefix_ct-MappingType.MLP-only_prefix(False)-only_image(False)-best_model.pt'
+
 
 object_model = get_object_model(object_model_path)
 clip_model, preprocess = get_clip_model(clip_model_path)
+cnn_captionType_model = get_cnn_captionType_model(cnn_captionType_model_path)
+cnn_violationType_model = get_cnn_violationType_model(cnn_violationType_model_path)
 caption_model, tokenizer = get_caption_model(caption_model_path)
+cnn_image_encoder = get_cnn_image_encoder(caption_model, cnn_image_encoder_path)
+
 
 type_dict = {
     'caption_type': ['violation', 'status'],
     'violation_type': ['墜落', '機械', '物料', '感電', '防護具', '穿刺', '爆炸', '工作場所', '搬運']
+}
+
+cnn_type_dict = {
+    'caption_type': ['現況', '缺失'],
+    'violation_type': ['墜落', '防護具', '感電', '工作場所', '物料', '爆炸', '穿刺', '機械', '搬運']
 }
 
 if __name__ == "__main__":
