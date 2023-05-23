@@ -111,7 +111,7 @@ def image_caption(image, caption_type, violation_type):
     encode_attribute = torch.cat((encode_attribute, torch.zeros(padding, dtype=torch.int64))).to(device)
 
     prefix_embed = caption_model.clip_project(prefix).reshape(1, prefix_length, -1)
-    embedding_text = caption_model.gpt.transformer.wte(encode_attribute).unsqueeze(0)
+    embedding_text = caption_model.model.transformer.wte(encode_attribute).unsqueeze(0)
     embedding_cat = torch.cat((prefix_embed, embedding_text), dim=1)
 
     return generate_beam(caption_model, tokenizer, embed=embedding_cat)
@@ -140,7 +140,7 @@ class ClipCaptionModel(nn.Module):
         embedding_text = torch.cat((attribute, tokens), dim=1)
         embedding_text = self.model.transformer.wte(embedding_text)
 
-        prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
+        prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.model_embedding_size)
         embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
         
         if labels is not None:
@@ -155,8 +155,8 @@ class ClipCaptionModel(nn.Module):
         self.prefix_length = prefix_length
         self.model = GPT2LMHeadModel.from_pretrained(gpt2_type)
         self.model_embedding_size = self.model.transformer.wte.weight.shape[1]
-        self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
-                                     self.gpt_embedding_size * prefix_length))
+        self.clip_project = MLP((prefix_size, (self.model_embedding_size * prefix_length) // 2,
+                                     self.model_embedding_size * prefix_length))
 
 def generate_beam(
     model,
