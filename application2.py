@@ -11,6 +11,7 @@ from torchmetrics.functional import pairwise_cosine_similarity
 from typing import Tuple, Optional, Union
 import torch.nn as nn
 import math
+# from peft import PeftModel 
 
 
 def get_object_model(model_path):
@@ -27,32 +28,6 @@ def get_object_model(model_path):
     model.eval()
     return model
 
-def get_cnn_captionType_model(model_path):
-    cnn_captionType_model = torch.load(model_path)
-    cnn_captionType_model.to(device)
-
-    return cnn_captionType_model
-
-def get_cnn_violationType_model(model_path):
-    cnn_violationType_model = torch.load(model_path)
-    cnn_violationType_model.to(device)
-
-    return cnn_violationType_model
-
-def get_cnn_image_encoder(caption_model, model_path):
-    prefix_length = 20
-    image_encoder = torchvision.models.resnet152()
-    num_ftrs = image_encoder.fc.in_features
-    image_encoder.fc = nn.Sequential(
-        nn.Linear(num_ftrs, (caption_model.model_embedding_size*prefix_length)//2),
-        nn.Tanh(),
-        nn.Linear((caption_model.model_embedding_size*prefix_length)//2,caption_model.model_embedding_size*prefix_length),
-    )
-    image_encoder.load_state_dict(torch.load(model_path, map_location="cpu"))
-    image_encoder.to(device)
-
-    return image_encoder
-
 def get_clip_model(model_path):
     model, preprocess = clip.load("ViT-B/32", device=device)
     with open(model_path, 'rb') as opened_file: 
@@ -60,7 +35,7 @@ def get_clip_model(model_path):
     
     return model, preprocess
 
-def get_caption_model(model_path):
+def get_caption_model(clip_project_path, model_path):
     prefix_length = 20
     prefix_length_clip = 20
     prefix_dim = 512
@@ -69,6 +44,11 @@ def get_caption_model(model_path):
     model = ClipCaptionModel(prefix_length, clip_length=prefix_length_clip, prefix_size=prefix_dim,
                                   num_layers=8, gpt2_type=gpt2_type)
     model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+    
+    #LoRA
+    # model.clip_project.load_state_dict(torch.load(clip_project_path))
+    # model.model = PeftModel.from_pretrained(model.model, model_path)
+
     model.to(device)
 
     tokenizer = AutoTokenizer.from_pretrained(gpt2_type)
@@ -118,21 +98,6 @@ def clip_classification(image):
 
     return prediction['caption_type'], prediction['violation_type']
 
-def cnn_classification(image):
-
-    image = image.convert('RGB')
-    transform_toTensor = torchvision.transforms.Compose([torchvision.transforms.Resize([256,256]), torchvision.transforms.CenterCrop([224,224]), torchvision.transforms.ToTensor()])
-    image = transform_toTensor(image)
-    image = image.unsqueeze(0)
-    image = image.to(device, dtype=torch.float32)
-
-    _, caption_type_idx = torch.max(cnn_captionType_model(image), 1)
-    caption_type = cnn_type_dict['caption_type'][caption_type_idx]
-
-    _, violation_type_idx = torch.max(cnn_violationType_model(image), 1)
-    violation_type = cnn_type_dict['violation_type'][violation_type_idx]
-    return caption_type, violation_type
-
 def image_caption(image, caption_type, violation_type):
     prefix_length = 20
     attribute_length = 20
@@ -151,33 +116,12 @@ def image_caption(image, caption_type, violation_type):
 
     return generate_beam(caption_model, tokenizer, embed=embedding_cat)
 
-def cnn_image_caption(image, caption_type, violation_type):
-    prefix_length = 20
-    attribute_length = 20
-
-    image = image.convert('RGB')
-    transform_toTensor = torchvision.transforms.Compose([torchvision.transforms.Resize([256,256]), torchvision.transforms.CenterCrop([224,224]), torchvision.transforms.ToTensor()])
-    image = transform_toTensor(image)
-    image = image.unsqueeze(0).to(device, dtype=torch.float32)
-
-    attribute = f'{caption_type} {violation_type} '
-    
-    encode_attribute = torch.tensor(tokenizer.encode(attribute), dtype=torch.int64)
-    padding = attribute_length - encode_attribute.shape[0]
-    encode_attribute = torch.cat((encode_attribute, torch.zeros(padding, dtype=torch.int64))).to(device)
-
-    prefix_embed = cnn_image_encoder(image).reshape(1, prefix_length, -1)
-    embedding_text = caption_model.model.transformer.wte(encode_attribute).unsqueeze(0)
-    embedding_cat = torch.cat((prefix_embed, embedding_text), dim=1)
-
-    return generate_beam(caption_model, tokenizer, embed=embedding_cat)
-
 class MLP(nn.Module):
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         return self.model(x)
 
-    def __init__(self, sizes: Tuple[int, ...], bias=True, act=nn.Tanh):
+    def __init__(self, sizes, bias=True, act=nn.Tanh):
         super(MLP, self).__init__()
         layers = []
         for i in range(len(sizes) - 1):
@@ -194,24 +138,14 @@ class ClipCaptionModel(nn.Module):
     def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, attribute: torch.Tensor, mask: Optional[torch.Tensor]=None,
                 labels: Optional[torch.Tensor] = None):
         embedding_text = torch.cat((attribute, tokens), dim=1)
-        # embedding_text = self.gpt.transformer.wte(embedding_text)
-        #cnn try
         embedding_text = self.model.transformer.wte(embedding_text)
 
-
-
-        # prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
-        
-        #cnn try
-        prefix_projections = prefix.view(-1, self.prefix_length, self.model_embedding_size)
-
+        prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
         embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
         
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
             labels = torch.cat((dummy_token, tokens), dim=1)
-        # out = self.gpt(inputs_embeds=embedding_cat, labels=labels, attention_mask=mask)
-        #cnn try
         out = self.model(inputs_embeds=embedding_cat, labels=labels, attention_mask=mask)
         return out
 
@@ -219,14 +153,10 @@ class ClipCaptionModel(nn.Module):
                  num_layers: int = 8, gpt2_type: str = ''):
         super(ClipCaptionModel, self).__init__()
         self.prefix_length = prefix_length
-        # self.gpt = GPT2LMHeadModel.from_pretrained(gpt2_type)
-        # self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
         self.model = GPT2LMHeadModel.from_pretrained(gpt2_type)
         self.model_embedding_size = self.model.transformer.wte.weight.shape[1]
-
-        #cnn_try
-        # self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
-        #                              self.gpt_embedding_size * prefix_length))
+        self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
+                                     self.gpt_embedding_size * prefix_length))
 
 def generate_beam(
     model,
@@ -373,15 +303,9 @@ def predict():
         file.save(saveLocation)
         image = Image.open(saveLocation)
 
-        # prediction = object_detection(image)
-        # caption_type, violation_type = clip_classification(image)
-        # caption = image_caption(image, caption_type, violation_type)
-        # issue_type = similarity_caption_issueType(caption, violation_type) 
-
-        #cnn try
         prediction = object_detection(image)
-        caption_type, violation_type = cnn_classification(image)
-        caption = cnn_image_caption(image, caption_type, violation_type)
+        caption_type, violation_type = clip_classification(image)
+        caption = image_caption(image, caption_type, violation_type)
         issue_type = similarity_caption_issueType(caption, violation_type) 
         
         return jsonify({"boxes": prediction['boxes'], 
@@ -405,33 +329,20 @@ def home():
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 object_model_path = 'model_final.pth'
-clip_model_path = 'clip_comb2_0_comb9_6_cap2_5.pt'
-# caption_model_path = 'coco_prefix_ct-0399.pt'
+clip_model_path = 'clip_comb2_1_comb9_7_cap2_0.pt'
+caption_model_path = 'gpt2-coco_prefix_ct-MappingType.MLP-only_prefix(False)-only_image(False)-best_model.pt'
+#if you use LoRA, it needs clip_project_path
+clip_project_path = 'gpt2-LoRA-clip_project-best_model.pt'
 label_path = 'labels.json'
 issueType_path = 'issueType.json'
-#CNN try
-cnn_captionType_model_path = 'CNN_caption_type_classifier.pt'
-cnn_violationType_model_path = 'CNN_violation_type_classifier.pt'
-cnn_image_encoder_path = 'CNN-image-encoder-gpt2-coco_prefix_ct-MappingType.MLP-only_prefix(False)-only_image(False)-best_model.pt'
-caption_model_path = 'CNN-gpt2-coco_prefix_ct-MappingType.MLP-only_prefix(False)-only_image(False)-best_model.pt'
-
 
 object_model = get_object_model(object_model_path)
 clip_model, preprocess = get_clip_model(clip_model_path)
-cnn_captionType_model = get_cnn_captionType_model(cnn_captionType_model_path)
-cnn_violationType_model = get_cnn_violationType_model(cnn_violationType_model_path)
-caption_model, tokenizer = get_caption_model(caption_model_path)
-cnn_image_encoder = get_cnn_image_encoder(caption_model, cnn_image_encoder_path)
-
+caption_model, tokenizer = get_caption_model(clip_project_path, caption_model_path)
 
 type_dict = {
     'caption_type': ['violation', 'status'],
     'violation_type': ['墜落', '機械', '物料', '感電', '防護具', '穿刺', '爆炸', '工作場所', '搬運']
-}
-
-cnn_type_dict = {
-    'caption_type': ['現況', '缺失'],
-    'violation_type': ['墜落', '防護具', '感電', '工作場所', '物料', '爆炸', '穿刺', '機械', '搬運']
 }
 
 if __name__ == "__main__":
